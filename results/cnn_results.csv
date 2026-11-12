@@ -1,0 +1,2 @@
+model,best_epoch,validation_macro_f1,test_accuracy,test_macro_f1,test_loss
+CNN Mel Spectrogram,30,0.7133200842844805,0.599502487562189,0.5737240419397237,1.5386935881714323
