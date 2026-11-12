@@ -1,0 +1,798 @@
+
+# ============================================================
+# PHASE 5: CNN ENVIRONMENTAL SOUND CLASSIFICATION
+# Dataset: ESC-50
+# Input: Mel Spectrograms
+# Model: Convolutional Neural Network
+# ============================================================
+
+import os
+import random
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import librosa
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+
+from sklearn.metrics import (
+    accuracy_score,
+    f1_score,
+    classification_report,
+    confusion_matrix
+)
+
+
+# ============================================================
+# 1. CONFIGURATION
+# ============================================================
+
+PROJECT_DIR = Path(__file__).resolve().parent
+
+AUDIO_DIR = PROJECT_DIR / "audio"
+RESULTS_DIR = PROJECT_DIR / "results"
+
+TRAIN_FILE = RESULTS_DIR / "train_split.csv"
+VAL_FILE = RESULTS_DIR / "validation_split.csv"
+TEST_FILE = RESULTS_DIR / "test_split.csv"
+
+RESULTS_DIR.mkdir(exist_ok=True)
+
+SAMPLE_RATE = 22050
+N_MELS = 128
+N_FFT = 2048
+HOP_LENGTH = 512
+TARGET_FRAMES = 216
+
+BATCH_SIZE = 32
+EPOCHS = 30
+LEARNING_RATE = 0.001
+PATIENCE = 7
+
+SEED = 42
+
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+
+DEVICE = torch.device(
+    "cuda" if torch.cuda.is_available() else "cpu"
+)
+
+print("=" * 60)
+print("CNN ENVIRONMENTAL SOUND CLASSIFICATION")
+print("=" * 60)
+
+print("Using device:", DEVICE)
+
+
+# ============================================================
+# 2. LOAD THE DATA SPLITS
+# ============================================================
+
+train_df = pd.read_csv(TRAIN_FILE)
+val_df = pd.read_csv(VAL_FILE)
+test_df = pd.read_csv(TEST_FILE)
+
+print("\nDataset sizes:")
+print("Training:", len(train_df))
+print("Validation:", len(val_df))
+print("Testing:", len(test_df))
+
+# Create class names in target-number order
+
+class_mapping = (
+    train_df[["target", "category"]]
+    .drop_duplicates()
+    .sort_values("target")
+)
+
+class_names = class_mapping["category"].tolist()
+
+NUM_CLASSES = len(class_names)
+
+print("\nNumber of classes:", NUM_CLASSES)
+print("Classes:", class_names)
+
+
+# ============================================================
+# 3. EXTRACT MEL SPECTROGRAM FEATURES
+# ============================================================
+
+def extract_mel_spectrogram(filename):
+
+    filepath = AUDIO_DIR / filename
+
+    audio, sr = librosa.load(
+        filepath,
+        sr=SAMPLE_RATE,
+        mono=True
+    )
+
+    mel = librosa.feature.melspectrogram(
+        y=audio,
+        sr=sr,
+        n_fft=N_FFT,
+        hop_length=HOP_LENGTH,
+        n_mels=N_MELS,
+        power=2.0
+    )
+
+    mel_db = librosa.power_to_db(
+        mel,
+        ref=np.max,
+        top_db=80
+    )
+
+    # Normalize values to approximately 0-1
+
+    mel_db = (mel_db + 80) / 80
+
+    # Ensure every spectrogram has the same number of frames
+
+    if mel_db.shape[1] < TARGET_FRAMES:
+
+        padding = TARGET_FRAMES - mel_db.shape[1]
+
+        mel_db = np.pad(
+            mel_db,
+            ((0, 0), (0, padding)),
+            mode="constant"
+        )
+
+    else:
+
+        mel_db = mel_db[:, :TARGET_FRAMES]
+
+    return mel_db.astype(np.float32)
+
+
+# ============================================================
+# 4. PREPARE AND CACHE FEATURES
+# ============================================================
+
+cache_file = RESULTS_DIR / "mel_spectrogram_features.npz"
+
+all_df = pd.concat(
+    [train_df, val_df, test_df],
+    ignore_index=True
+)
+
+all_df = all_df.drop_duplicates(
+    subset="filename"
+).reset_index(drop=True)
+
+file_list = all_df["filename"].tolist()
+
+if cache_file.exists():
+
+    print("\nLoading previously extracted Mel features...")
+
+    cached = np.load(cache_file, allow_pickle=False)
+
+    if cached["filenames"].tolist() == file_list:
+
+        X_all = cached["X"]
+        print("Feature cache loaded successfully.")
+
+    else:
+
+        print("Cache does not match dataset. Extracting again.")
+
+        X_all = None
+
+else:
+
+    X_all = None
+
+
+if X_all is None:
+
+    print("\nExtracting Mel spectrograms...")
+    print("This may take several minutes.")
+
+    features = []
+
+    for i, filename in enumerate(file_list):
+
+        feature = extract_mel_spectrogram(filename)
+
+        features.append(feature)
+
+        if (i + 1) % 100 == 0:
+            print(f"Processed {i + 1}/{len(file_list)}")
+
+    X_all = np.array(
+        features,
+        dtype=np.float32
+    )
+
+    np.savez_compressed(
+        cache_file,
+        X=X_all,
+        filenames=np.array(file_list)
+    )
+
+    print("\nFeature extraction completed.")
+    print("Features saved to:", cache_file)
+
+
+print("\nFeature matrix shape:", X_all.shape)
+
+
+# ============================================================
+# 5. CONNECT FEATURES WITH DATA SPLITS
+# ============================================================
+
+filename_to_index = {
+    filename: i
+    for i, filename in enumerate(file_list)
+}
+
+
+def prepare_split(df):
+
+    indices = [
+        filename_to_index[filename]
+        for filename in df["filename"]
+    ]
+
+    X = X_all[indices]
+
+    y = df["target"].to_numpy(dtype=np.int64)
+
+    # CNN input shape: samples, channels, height, width
+
+    X = X[:, np.newaxis, :, :]
+
+    return X, y
+
+
+X_train, y_train = prepare_split(train_df)
+X_val, y_val = prepare_split(val_df)
+X_test, y_test = prepare_split(test_df)
+
+print("\nSPLIT VERIFICATION")
+
+print("Training:", X_train.shape, y_train.shape)
+print("Validation:", X_val.shape, y_val.shape)
+print("Testing:", X_test.shape, y_test.shape)
+
+
+# ============================================================
+# 6. CREATE PYTORCH DATASET
+# ============================================================
+
+class SoundDataset(Dataset):
+
+    def __init__(self, X, y):
+
+        self.X = torch.tensor(
+            X,
+            dtype=torch.float32
+        )
+
+        self.y = torch.tensor(
+            y,
+            dtype=torch.long
+        )
+
+    def __len__(self):
+
+        return len(self.y)
+
+    def __getitem__(self, index):
+
+        return self.X[index], self.y[index]
+
+
+train_dataset = SoundDataset(X_train, y_train)
+val_dataset = SoundDataset(X_val, y_val)
+test_dataset = SoundDataset(X_test, y_test)
+
+train_loader = DataLoader(
+    train_dataset,
+    batch_size=BATCH_SIZE,
+    shuffle=True,
+    num_workers=0
+)
+
+val_loader = DataLoader(
+    val_dataset,
+    batch_size=BATCH_SIZE,
+    shuffle=False,
+    num_workers=0
+)
+
+test_loader = DataLoader(
+    test_dataset,
+    batch_size=BATCH_SIZE,
+    shuffle=False,
+    num_workers=0
+)
+
+
+# ============================================================
+# 7. DEFINE THE CNN ARCHITECTURE
+# ============================================================
+
+class EnvironmentalSoundCNN(nn.Module):
+
+    def __init__(self, num_classes):
+
+        super().__init__()
+
+        self.features = nn.Sequential(
+
+            # First convolutional block
+
+            nn.Conv2d(
+                1, 32,
+                kernel_size=3,
+                padding=1
+            ),
+
+            nn.BatchNorm2d(32),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+
+            # Second convolutional block
+
+            nn.Conv2d(
+                32, 64,
+                kernel_size=3,
+                padding=1
+            ),
+
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+
+            # Third convolutional block
+
+            nn.Conv2d(
+                64, 128,
+                kernel_size=3,
+                padding=1
+            ),
+
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+
+            # Fourth convolutional block
+
+            nn.Conv2d(
+                128, 128,
+                kernel_size=3,
+                padding=1
+            ),
+
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+
+            nn.AdaptiveAvgPool2d((4, 4))
+        )
+
+        self.classifier = nn.Sequential(
+
+            nn.Flatten(),
+
+            nn.Linear(128 * 4 * 4, 256),
+
+            nn.ReLU(),
+
+            nn.Dropout(0.4),
+
+            nn.Linear(256, num_classes)
+        )
+
+    def forward(self, x):
+
+        x = self.features(x)
+
+        x = self.classifier(x)
+
+        return x
+
+
+model = EnvironmentalSoundCNN(
+    num_classes=NUM_CLASSES
+).to(DEVICE)
+
+print("\nCNN MODEL")
+print(model)
+
+
+# ============================================================
+# 8. DEFINE LOSS AND OPTIMIZER
+# ============================================================
+
+criterion = nn.CrossEntropyLoss()
+
+optimizer = torch.optim.Adam(
+    model.parameters(),
+    lr=LEARNING_RATE
+)
+
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    optimizer,
+    mode="max",
+    factor=0.5,
+    patience=2
+)
+
+
+# ============================================================
+# 9. TRAINING FUNCTION
+# ============================================================
+
+def train_one_epoch():
+
+    model.train()
+
+    total_loss = 0
+
+    for X, y in train_loader:
+
+        X = X.to(DEVICE)
+        y = y.to(DEVICE)
+
+        optimizer.zero_grad()
+
+        outputs = model(X)
+
+        loss = criterion(outputs, y)
+
+        loss.backward()
+
+        optimizer.step()
+
+        total_loss += loss.item() * X.size(0)
+
+    return total_loss / len(train_dataset)
+
+
+# ============================================================
+# 10. VALIDATION FUNCTION
+# ============================================================
+
+def evaluate(loader):
+
+    model.eval()
+
+    total_loss = 0
+
+    all_predictions = []
+    all_labels = []
+
+    with torch.no_grad():
+
+        for X, y in loader:
+
+            X = X.to(DEVICE)
+            y = y.to(DEVICE)
+
+            outputs = model(X)
+
+            loss = criterion(outputs, y)
+
+            predictions = torch.argmax(
+                outputs,
+                dim=1
+            )
+
+            total_loss += loss.item() * X.size(0)
+
+            all_predictions.extend(
+                predictions.cpu().numpy()
+            )
+
+            all_labels.extend(
+                y.cpu().numpy()
+            )
+
+    average_loss = total_loss / len(loader.dataset)
+
+    accuracy = accuracy_score(
+        all_labels,
+        all_predictions
+    )
+
+    macro_f1 = f1_score(
+        all_labels,
+        all_predictions,
+        average="macro",
+        zero_division=0
+    )
+
+    return (
+        average_loss,
+        accuracy,
+        macro_f1
+    )
+
+
+# ============================================================
+# 11. TRAIN THE CNN
+# ============================================================
+
+print("\nSTARTING CNN TRAINING")
+print("=" * 60)
+
+best_val_f1 = -1
+best_epoch = 0
+epochs_without_improvement = 0
+
+history = []
+
+model_file = RESULTS_DIR / "best_cnn_model.pth"
+
+for epoch in range(EPOCHS):
+
+    train_loss = train_one_epoch()
+
+    val_loss, val_accuracy, val_f1 = evaluate(
+        val_loader
+    )
+
+    scheduler.step(val_f1)
+
+    history.append({
+        "epoch": epoch + 1,
+        "train_loss": train_loss,
+        "validation_loss": val_loss,
+        "validation_accuracy": val_accuracy,
+        "validation_macro_f1": val_f1
+    })
+
+    print(
+        f"Epoch {epoch + 1:02d}/{EPOCHS} | "
+        f"Train Loss: {train_loss:.4f} | "
+        f"Val Loss: {val_loss:.4f} | "
+        f"Val Accuracy: {val_accuracy:.4f} | "
+        f"Val Macro F1: {val_f1:.4f}"
+    )
+
+    # Save the best model based on validation macro F1
+
+    if val_f1 > best_val_f1:
+
+        best_val_f1 = val_f1
+        best_epoch = epoch + 1
+
+        torch.save(
+            model.state_dict(),
+            model_file
+        )
+
+        epochs_without_improvement = 0
+
+        print("  Best model saved.")
+
+    else:
+
+        epochs_without_improvement += 1
+
+    # Early stopping
+
+    if epochs_without_improvement >= PATIENCE:
+
+        print("\nEarly stopping activated.")
+
+        break
+
+
+# ============================================================
+# 12. SAVE TRAINING HISTORY
+# ============================================================
+
+history_df = pd.DataFrame(history)
+
+history_df.to_csv(
+    RESULTS_DIR / "cnn_training_history.csv",
+    index=False
+)
+
+# Plot training and validation loss
+
+plt.figure(figsize=(9, 5))
+
+plt.plot(
+    history_df["epoch"],
+    history_df["train_loss"],
+    label="Training Loss"
+)
+
+plt.plot(
+    history_df["epoch"],
+    history_df["validation_loss"],
+    label="Validation Loss"
+)
+
+plt.xlabel("Epoch")
+plt.ylabel("Loss")
+plt.title("CNN Training and Validation Loss")
+
+plt.legend()
+plt.grid(alpha=0.3)
+plt.tight_layout()
+
+plt.savefig(
+    RESULTS_DIR / "06_cnn_training_loss.png",
+    dpi=300
+)
+
+plt.close()
+
+
+# ============================================================
+# 13. FINAL TEST EVALUATION
+# ============================================================
+
+print("\n" + "=" * 60)
+print("FINAL CNN TEST EVALUATION")
+print("=" * 60)
+
+# Load the best validation model
+
+model.load_state_dict(
+    torch.load(
+        model_file,
+        map_location=DEVICE
+    )
+)
+
+test_loss, test_accuracy, test_macro_f1 = evaluate(
+    test_loader
+)
+
+print("Best epoch:", best_epoch)
+print("Best validation Macro F1:", round(best_val_f1, 4))
+
+print("\nTest Loss:", round(test_loss, 4))
+print("Test Accuracy:", round(test_accuracy, 4))
+print("Test Macro F1:", round(test_macro_f1, 4))
+
+
+# ============================================================
+# 14. CLASSIFICATION REPORT AND CONFUSION MATRIX
+# ============================================================
+
+model.eval()
+
+all_predictions = []
+all_labels = []
+
+with torch.no_grad():
+
+    for X, y in test_loader:
+
+        X = X.to(DEVICE)
+
+        outputs = model(X)
+
+        predictions = torch.argmax(
+            outputs,
+            dim=1
+        )
+
+        all_predictions.extend(
+            predictions.cpu().numpy()
+        )
+
+        all_labels.extend(
+            y.numpy()
+        )
+
+
+print("\nCLASSIFICATION REPORT")
+
+print(
+    classification_report(
+        all_labels,
+        all_predictions,
+        labels=list(range(NUM_CLASSES)),
+        target_names=class_names,
+        zero_division=0
+    )
+)
+
+
+# Confusion matrix
+
+cm = confusion_matrix(
+    all_labels,
+    all_predictions,
+    labels=list(range(NUM_CLASSES))
+)
+
+plt.figure(figsize=(18, 15))
+
+sns.heatmap(
+    cm,
+    cmap="Blues",
+    xticklabels=class_names,
+    yticklabels=class_names
+)
+
+plt.title("ESC-50 CNN Confusion Matrix")
+plt.xlabel("Predicted Label")
+plt.ylabel("True Label")
+
+plt.xticks(rotation=90, fontsize=8)
+plt.yticks(rotation=0, fontsize=8)
+
+plt.tight_layout()
+
+plt.savefig(
+    RESULTS_DIR / "07_cnn_confusion_matrix.png",
+    dpi=300
+)
+
+plt.close()
+
+
+# ============================================================
+# 15. SAVE PREDICTIONS AND RESULTS
+# ============================================================
+
+prediction_df = pd.DataFrame({
+
+    "filename": test_df["filename"].tolist(),
+
+    "actual": [
+        class_names[i] for i in all_labels
+    ],
+
+    "predicted": [
+        class_names[i] for i in all_predictions
+    ]
+
+})
+
+prediction_df.to_csv(
+    RESULTS_DIR / "cnn_test_predictions.csv",
+    index=False
+)
+
+
+cnn_results = pd.DataFrame([{
+
+    "model": "CNN Mel Spectrogram",
+
+    "best_epoch": best_epoch,
+
+    "validation_macro_f1": best_val_f1,
+
+    "test_accuracy": test_accuracy,
+
+    "test_macro_f1": test_macro_f1,
+
+    "test_loss": test_loss
+
+}])
+
+cnn_results.to_csv(
+    RESULTS_DIR / "cnn_results.csv",
+    index=False
+)
+
+
+print("\n" + "=" * 60)
+print("PHASE 5 COMPLETED")
+print("=" * 60)
+
+print("Best model:", model_file)
+print("Training history saved.")
+print("Confusion matrix saved.")
+print("Test predictions saved.")
+print("CNN results saved.")
